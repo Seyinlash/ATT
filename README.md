@@ -1,48 +1,48 @@
 # Assisted Typing Tool (ATT)
 
-Assisted Typing Tool is a Windows desktop app that automates typing and mouse clicking. It is built with Python and Tkinter and uses [`pyautogui`](https://pypi.org/project/PyAutoGUI/) to send real keystrokes and clicks to whichever application you choose—browsers, chats, documents, code editors, and more.
+Assisted Typing Tool is a Windows desktop app that automates typing and mouse clicking. It is built with Python and Tkinter and uses [`pyautogui`](https://pypi.org/project/PyAutoGUI/) to send real keystrokes and clicks to whichever application you choose-browsers, chats, documents, code editors, and more.
 
 ATT includes two modes:
 
-- **Auto Typer** — types user-provided text with adjustable, human-like timing.
-- **Auto Clicker** — repeatedly clicks a selected location using configurable timing and click behavior.
+- **Auto Typer** - types user-provided text with adjustable, human-like timing.
+- **Auto Clicker** - repeatedly clicks a selected location using configurable timing and click behavior.
 
 ## Features
 
 ### Auto Typer
 
-- **GUI text input** — paste or write any text you want typed.
-- **Human-like timing** — randomizes delays between keystrokes and adds occasional longer pauses.
-- **Adjustable speed** — controls the base delay per character.
-- **Start delay countdown** — gives you time to focus the target application before typing begins.
-- **Typo simulation** — occasionally types a wrong character, pauses, backspaces, and corrects it. The chance is adjustable per word.
-- **Auto-indent correction** — removes unwanted indentation inserted by smart editors before typing the intended leading whitespace.
-- **Loop mode** — repeats the same text until stopped.
-- **Live time estimate** — shows approximately how long the current text will take to type.
-- **Completion timing** — reports how long a completed run actually took.
-- **Clear button** — quickly empties the text box.
+- **GUI text input** - paste or write any text you want typed.
+- **Human-like timing** - randomizes delays between keystrokes and adds occasional longer pauses.
+- **Adjustable speed** - controls the base delay per character.
+- **Start delay countdown** - gives you time to focus the target application before typing begins.
+- **Typo simulation** - occasionally types a wrong character, pauses, backspaces, and corrects it. The chance is adjustable per word.
+- **Auto-indent correction** - removes unwanted indentation inserted by smart editors before typing the intended leading whitespace.
+- **Loop mode** - repeats the same text until stopped.
+- **Live time estimate** - shows approximately how long the current text will take to type.
+- **Completion timing** - reports how long a completed run actually took.
+- **Clear button** - quickly empties the text box.
 
 ### Auto Clicker
 
-- **Adjustable click interval** — enter the delay in milliseconds or seconds.
-- **Multiple click types** — left, right, middle, or double-click.
-- **Flexible targeting** — use the cursor position captured when the countdown ends or enter fixed X/Y coordinates.
-- **Location picker** — hover over a target and press `F8` to capture its coordinates.
-- **Fixed or infinite runs** — stop after a chosen number of clicks or continue until you press Stop.
-- **Optional timing jitter** — randomizes the interval between clicks for less mechanical timing.
-- **Live click progress** — displays the current and total click count.
+- **Adjustable click interval** - enter the delay in milliseconds or seconds.
+- **Multiple click types** - left, right, middle, or double-click.
+- **Flexible targeting** - use the cursor position captured when the countdown ends or enter fixed X/Y coordinates.
+- **Location picker** - hover over a target and press `F8` to capture its coordinates.
+- **Fixed or infinite runs** - stop after a chosen number of clicks or continue until you press Stop.
+- **Optional timing jitter** - randomizes the interval between clicks for less mechanical timing.
+- **Live click progress** - displays the current and total click count.
 
 ### Shared controls
 
-- **Auto Typer / Auto Clicker switcher** — changes modes from the main window and remembers the last mode used.
-- **Floating control window** — an optional borderless, always-on-top panel displays status and progress while a run is active.
-- **Pause and resume** — pause either mode between keystrokes or clicks without ending the run.
-- **Stop control** — stop from the main window or floating panel.
-- **Draggable pop-out** — move the floating panel anywhere on the screen; ATT remembers its last position.
-- **Pinned pop-out option** — optionally keep the panel open after a run finishes.
-- **Emergency failsafe** — move the mouse to a screen corner to abort automation immediately.
-- **Light and dark themes** — the selected theme applies to the main window, Settings, and floating controls.
-- **Persistent settings** — ATT automatically saves changes to `~/.auto_typer_settings.json`.
+- **Auto Typer / Auto Clicker switcher** - changes modes from the main window and remembers the last mode used.
+- **Floating control window** - an optional borderless, always-on-top panel displays status and progress while a run is active.
+- **Pause and resume** - pause either mode between keystrokes or clicks without ending the run.
+- **Stop control** - stop from the main window or floating panel.
+- **Draggable pop-out** - move the floating panel anywhere on the screen; ATT remembers its last position.
+- **Pinned pop-out option** - optionally keep the panel open after a run finishes.
+- **Emergency failsafe** - move the mouse to a screen corner to abort automation immediately.
+- **Light and dark themes** - the selected theme applies to the main window, Settings, and floating controls.
+- **Persistent settings** - ATT automatically saves changes to `~/.auto_typer_settings.json`.
 
 ## Requirements
 
