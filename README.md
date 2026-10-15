@@ -106,7 +106,7 @@ Install [PyInstaller](https://pyinstaller.org/) and build ATT:
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --name "ATT" auto_typer.py
+python -m PyInstaller --onefile --windowed --name "ATT" att.py
 ```
 
 The finished executable will be placed in the `dist` folder. It can run on Windows without a separate Python installation.
