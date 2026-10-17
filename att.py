@@ -8,6 +8,7 @@ screen corner during a run to trigger pyautogui's failsafe (when enabled).
 
 import ctypes
 import json
+import logging
 import os
 import queue
 import random
@@ -22,6 +23,16 @@ try:
 except ImportError:
     pyautogui = None
 
+
+APP_NAME = "Assisted Typing Tool"
+APP_SHORT_NAME = "ATT"
+APP_VERSION = "6.0.0"
+COPYRIGHT_TEXT = "© 2026 Seyinlash. All rights reserved."
+MIN_WPM = 5
+MAX_WPM = 300
+DEFAULT_WPM = 80
+INDENT_SETTLE_SECONDS = 0.10
+LOGGER = logging.getLogger("att")
 
 LIGHT = {
     "bg": "#f2f2f2", "fg": "#111111", "text_bg": "#ffffff",
@@ -41,6 +52,7 @@ DEFAULT_SETTINGS = {
     "last_mode": "typer",
     "start_delay": 5.0,
     "char_delay": 0.05,
+    "wpm": DEFAULT_WPM,
     "human_mode": True,
     "loop_mode": False,
     "fix_indent": True,
@@ -67,10 +79,21 @@ def load_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Could not load settings: %s", exc)
         data = {}
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data if isinstance(data, dict) else {})
+    if "wpm" not in data:
+        try:
+            old_delay = float(data.get("char_delay", DEFAULT_SETTINGS["char_delay"]))
+            merged["wpm"] = round(12.0 / old_delay) if old_delay > 0 else MAX_WPM
+        except (TypeError, ValueError):
+            merged["wpm"] = DEFAULT_WPM
+    try:
+        merged["wpm"] = validate_wpm(merged["wpm"])
+    except ValueError:
+        merged["wpm"] = DEFAULT_WPM
     return merged
 
 
@@ -78,8 +101,115 @@ def save_settings(data):
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
-    except Exception:
-        pass
+        return True
+    except OSError as exc:
+        LOGGER.error("Could not save settings: %s", exc)
+        return False
+
+
+def validate_wpm(value):
+    """Return a validated integer WPM value or raise ValueError."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value == "" or value is None:
+        raise ValueError("WPM cannot be empty.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("WPM must be a number.") from exc
+    if not numeric.is_integer():
+        raise ValueError("WPM must be a whole number.")
+    numeric = int(numeric)
+    if not MIN_WPM <= numeric <= MAX_WPM:
+        raise ValueError(f"WPM must be between {MIN_WPM} and {MAX_WPM}.")
+    return numeric
+
+
+def wpm_to_interval(wpm):
+    """Convert standardized WPM to seconds per character.
+
+    Typing tests define one word as five characters (including spaces), so
+    seconds/character = 60 / (WPM * 5). Actual words may be longer or shorter;
+    the five-character standard keeps the control predictable.
+    """
+    return 60.0 / (validate_wpm(wpm) * 5.0)
+
+
+def validate_typing_text(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Type or paste something in the box first.")
+    return text
+
+
+def clear_editor_auto_indent(backend, wait_fn=time.sleep):
+    """Clear only the current editor line after Enter.
+
+    Two Home presses normalize smart-Home behavior across VS Code/Monaco and
+    browser editors. Selecting Home-to-End removes real or delayed auto-indent
+    without selecting content from the preceding line.
+    """
+    if wait_fn(INDENT_SETTLE_SECONDS) is False:
+        return False
+    backend.press("home", presses=2, interval=0.01)
+    backend.hotkey("shift", "end")
+    # Delete is deliberately used instead of Backspace: with no indentation
+    # selected, Delete is a no-op while Backspace could join the prior line.
+    backend.press("delete")
+    return wait_fn(0.02) is not False
+
+
+def send_unicode_character(character):
+    """Send one non-ASCII character with Windows Unicode keyboard events."""
+    if os.name != "nt":
+        raise RuntimeError("Direct Unicode typing is currently supported on Windows only.")
+
+    from ctypes import wintypes
+
+    class KeyboardInput(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class HardwareInput(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+    class InputUnion(ctypes.Union):
+        _fields_ = [("ki", KeyboardInput), ("mi", MouseInput), ("hi", HardwareInput)]
+
+    class Input(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [("type", wintypes.DWORD), ("value", InputUnion)]
+
+    units = character.encode("utf-16-le")
+    events = []
+    extra = ctypes.c_ulong(0)
+    for index in range(0, len(units), 2):
+        unit = int.from_bytes(units[index:index + 2], "little")
+        events.append(Input(type=1, ki=KeyboardInput(0, unit, 0x0004, 0, ctypes.pointer(extra))))
+        events.append(Input(type=1, ki=KeyboardInput(0, unit, 0x0004 | 0x0002, 0, ctypes.pointer(extra))))
+    array_type = Input * len(events)
+    sent = ctypes.windll.user32.SendInput(len(events), array_type(*events), ctypes.sizeof(Input))
+    if sent != len(events):
+        raise OSError("Windows could not send the Unicode keyboard event.")
+
+
+def emit_character(backend, character, unicode_sender=send_unicode_character):
+    """Send ASCII through pyautogui and Unicode through the Windows path."""
+    if len(character) != 1:
+        raise ValueError("emit_character expects exactly one character.")
+    if ord(character) < 128:
+        backend.write(character)
+    else:
+        unicode_sender(character)
 
 
 def format_duration(total_seconds):
@@ -94,7 +224,7 @@ class SettingsWindow(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("ATT - Settings")
+        self.title("Auto Typer / Clicker - Settings")
         self.resizable(False, False)
         self.transient(app.root)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -110,16 +240,18 @@ class SettingsWindow(tk.Toplevel):
         notebook.add(general, text="General")
 
         self._label_spin(typer, 0, "Start delay (sec):", app.start_delay, 0, 60, 0.5)
-        self._label_spin(typer, 1, "Base delay/char (sec):", app.char_delay, 0, 1, 0.01)
+        self._label_spin(typer, 1, "Typing speed (WPM):", app.wpm, MIN_WPM, MAX_WPM, 1)
+        ttk.Label(typer, text="Standard WPM uses five characters per word.").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Checkbutton(typer, text="Human-like variation (random pauses)",
-                        variable=app.human_mode).grid(row=2, column=0, columnspan=2, sticky="w", pady=6)
+                        variable=app.human_mode).grid(row=3, column=0, columnspan=2, sticky="w", pady=6)
         ttk.Checkbutton(typer, text="Repeat / loop", variable=app.loop_mode).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=6)
+            row=4, column=0, columnspan=2, sticky="w", pady=6)
         ttk.Checkbutton(typer, text="Fix editor auto-indent (recommended for VS Code / IDEs)",
-                        variable=app.fix_indent).grid(row=4, column=0, columnspan=2, sticky="w", pady=6)
+                        variable=app.fix_indent).grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
         ttk.Checkbutton(typer, text="Simulate typos, then backspace + correct them",
-                        variable=app.typo_mode).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self._label_spin(typer, 6, "Typo chance (%):", app.typo_chance, 0, 100, 1)
+                        variable=app.typo_mode).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._label_spin(typer, 7, "Typo chance (%):", app.typo_chance, 0, 100, 1)
 
         ttk.Label(clicker, text="The everyday click controls also appear on the main page.",
                   foreground=app.colors["status_fg"]).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -131,6 +263,9 @@ class SettingsWindow(tk.Toplevel):
                         variable=app.popout_enabled).grid(row=0, column=0, sticky="w", pady=6)
         ttk.Checkbutton(general, text="Keep pop-out open after a run finishes",
                         variable=app.popout_pinned).grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Separator(general).grid(row=4, column=0, sticky="ew", pady=(12, 8))
+        ttk.Label(general, text=f"{APP_NAME} (ATT) v{APP_VERSION}").grid(row=5, column=0, sticky="w")
+        ttk.Label(general, text=COPYRIGHT_TEXT).grid(row=6, column=0, sticky="w", pady=(2, 0))
 
         footer = ttk.Frame(self)
         footer.pack(fill="x", padx=10, pady=(0, 10))
@@ -210,8 +345,8 @@ class PopoutWindow(tk.Toplevel):
             set_style = ctypes.windll.user32.SetWindowLongW
             exstyle = get_style(hwnd, -20)
             set_style(hwnd, -20, exstyle | 0x08000000 | 0x00000080)  # NOACTIVATE | TOOLWINDOW
-        except Exception:
-            pass
+        except (OSError, AttributeError, tk.TclError) as exc:
+            LOGGER.debug("Could not apply no-activate window style: %s", exc)
 
     def _drag_start(self, event):
         self._drag_origin = (event.x_root, event.y_root, self.winfo_x(), self.winfo_y())
@@ -244,7 +379,7 @@ class PopoutWindow(tk.Toplevel):
 class AutoTyperApp:
     def __init__(self, root):
         self.root = root
-        root.title("Assisted Typing Tool (ATT)")
+        root.title(f"{APP_NAME} (ATT)")
         root.geometry("700x700")
         root.minsize(700, 700)
 
@@ -258,6 +393,8 @@ class AutoTyperApp:
         self.target_hwnd = None
         self._pick_polling = False
         settings = load_settings()
+        self._wpm_lock = threading.Lock()
+        self._live_wpm = validate_wpm(settings.get("wpm", DEFAULT_WPM))
 
         self.style = ttk.Style()
         try:
@@ -271,6 +408,8 @@ class AutoTyperApp:
             self.mode.set("typer")
         self.start_delay = tk.DoubleVar(value=settings["start_delay"])
         self.char_delay = tk.DoubleVar(value=settings["char_delay"])
+        self.wpm = tk.StringVar(value=str(self._live_wpm))
+        self.wpm_display = tk.StringVar(value=f"{self._live_wpm} WPM")
         self.human_mode = tk.BooleanVar(value=settings["human_mode"])
         self.loop_mode = tk.BooleanVar(value=settings["loop_mode"])
         self.fix_indent = tk.BooleanVar(value=settings["fix_indent"])
@@ -290,7 +429,6 @@ class AutoTyperApp:
         self.popout_pinned = tk.BooleanVar(value=settings["popout_pinned"])
         self.popout_x = tk.StringVar(value="" if settings["popout_x"] is None else settings["popout_x"])
         self.popout_y = tk.StringVar(value="" if settings["popout_y"] is None else settings["popout_y"])
-
         self.typer_status = tk.StringVar(value="Ready.")
         self.typer_estimate = tk.StringVar(value="Estimated typing time: -")
         self.clicker_status = tk.StringVar(value="Ready.")
@@ -298,21 +436,26 @@ class AutoTyperApp:
         self.popout_status = tk.StringVar(value="Ready.")
         self.popout_progress = tk.StringVar(value="0%")
 
-        self._build_top_bar()
-        self.content_host = ttk.Frame(root)
+        self.standard_shell = ttk.Frame(root)
+        self._build_top_bar(self.standard_shell)
+        self.content_host = ttk.Frame(self.standard_shell)
         self.content_host.pack(fill="both", expand=True)
         self._build_typer_page()
         self._build_clicker_page()
-        self.hint_label = ttk.Label(root, text="Tip: flick the mouse to a screen corner anytime to abort.")
+        self.hint_label = ttk.Label(self.standard_shell, text="Tip: flick the mouse to a screen corner anytime to abort.")
         self.hint_label.pack(anchor="w", padx=10, pady=(0, 8))
-
+        self.standard_footer = ttk.Label(self.standard_shell, text=COPYRIGHT_TEXT, style="Footer.TLabel")
+        self.standard_footer.pack(anchor="center", pady=(0, 7))
         self.apply_theme()
         self.switch_mode(self.mode.get(), save=False)
+        self.standard_shell.pack(fill="both", expand=True)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Unmap>", self._on_window_unmap, add="+")
+        root.bind("<Map>", self._on_window_map, add="+")
         self.text_box.bind("<<Modified>>", self._on_text_modified)
 
         watched = (
-            self.start_delay, self.char_delay, self.human_mode, self.loop_mode,
+            self.start_delay, self.human_mode, self.loop_mode,
             self.fix_indent, self.typo_mode, self.typo_chance, self.click_interval,
             self.click_interval_unit, self.click_type, self.click_location_mode,
             self.click_x, self.click_y, self.click_count_mode, self.click_count,
@@ -321,8 +464,9 @@ class AutoTyperApp:
         )
         for var in watched:
             var.trace_add("write", self._setting_changed)
+        self.wpm.trace_add("write", self._on_wpm_changed)
         self.update_estimates()
-        self.root.after(40, self._drain_ui_queue)
+        self._ui_after_id = self.root.after(40, self._drain_ui_queue)
 
         if pyautogui is None:
             messagebox.showwarning("Missing dependency", "pyautogui isn't installed.\n\nRun:\n    pip install pyautogui\n\nthen restart this app.")
@@ -331,8 +475,8 @@ class AutoTyperApp:
     def colors(self):
         return DARK if self.dark_mode.get() else LIGHT
 
-    def _build_top_bar(self):
-        top = ttk.Frame(self.root)
+    def _build_top_bar(self, parent):
+        top = ttk.Frame(parent)
         top.pack(fill="x", padx=10, pady=(10, 0))
         self.mode_label = ttk.Label(top, text="Text to type:")
         self.mode_label.pack(side="left")
@@ -359,6 +503,17 @@ class AutoTyperApp:
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
         self.text_box.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        speed_row = ttk.Frame(self.typer_page)
+        speed_row.pack(fill="x", padx=10, pady=(7, 0))
+        ttk.Label(speed_row, text="Typing speed:").pack(side="left")
+        self.wpm_spin = ttk.Spinbox(speed_row, from_=MIN_WPM, to=MAX_WPM, increment=1,
+                                    textvariable=self.wpm, width=7)
+        self.wpm_spin.pack(side="left", padx=(7, 6))
+        ttk.Label(speed_row, textvariable=self.wpm_display).pack(side="left")
+        ttk.Label(speed_row, text="(updates live while typing)", style="Hint.TLabel").pack(
+            side="left", padx=(8, 0))
+        self.wpm_spin.bind("<FocusOut>", self._validate_wpm_widget)
+        self.wpm_spin.bind("<Return>", self._validate_wpm_widget)
         self.typer_status_label = ttk.Label(self.typer_page, textvariable=self.typer_status)
         self.typer_status_label.pack(anchor="w", padx=10, pady=(8, 0))
         ttk.Label(self.typer_page, textvariable=self.typer_estimate).pack(anchor="w", padx=10)
@@ -366,6 +521,8 @@ class AutoTyperApp:
         row.pack(fill="x", padx=10, pady=6)
         self.typer_start_btn = ttk.Button(row, text="Start", command=self.start_typing)
         self.typer_start_btn.pack(side="left", padx=(0, 8))
+        self.typer_pause_btn = ttk.Button(row, text="Pause", command=self.toggle_pause, state="disabled")
+        self.typer_pause_btn.pack(side="left", padx=(0, 8))
         self.typer_stop_btn = ttk.Button(row, text="Stop", command=self.stop_active_run, state="disabled")
         self.typer_stop_btn.pack(side="left", padx=(0, 8))
         self.clear_btn = ttk.Button(row, text="Clear", command=self.clear_text)
@@ -424,12 +581,47 @@ class AutoTyperApp:
         row.pack(fill="x", padx=10, pady=6)
         self.clicker_start_btn = ttk.Button(row, text="Start", command=self.start_clicking)
         self.clicker_start_btn.pack(side="left", padx=(0, 8))
+        self.clicker_pause_btn = ttk.Button(row, text="Pause", command=self.toggle_pause, state="disabled")
+        self.clicker_pause_btn.pack(side="left", padx=(0, 8))
         self.clicker_stop_btn = ttk.Button(row, text="Stop", command=self.stop_active_run, state="disabled")
         self.clicker_stop_btn.pack(side="left")
 
     def _setting_changed(self, *_args):
         self.update_estimates()
         self.save_all_settings()
+
+    def _on_wpm_changed(self, *_args):
+        try:
+            value = validate_wpm(self.wpm.get())
+        except ValueError:
+            self.wpm_display.set(f"Enter {MIN_WPM}-{MAX_WPM}")
+            return
+        with self._wpm_lock:
+            self._live_wpm = value
+        self.wpm_display.set(f"{value} WPM")
+        self.update_estimates()
+        self.save_all_settings()
+
+    def _validate_wpm_widget(self, _event=None):
+        try:
+            value = validate_wpm(self.wpm.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid WPM", str(exc), parent=self.root)
+            with self._wpm_lock:
+                value = self._live_wpm
+            self.wpm.set(str(value))
+            self.wpm_spin.focus_set()
+            self.wpm_spin.selection_range(0, "end")
+            return "break"
+        self.wpm.set(str(value))
+        return None
+
+    def _current_wpm(self):
+        with self._wpm_lock:
+            return self._live_wpm
+
+    def _current_char_interval(self):
+        return wpm_to_interval(self._current_wpm())
 
     @staticmethod
     def _safe_get(variable, fallback):
@@ -449,11 +641,13 @@ class AutoTyperApp:
             return fallback
 
     def save_all_settings(self):
+        current_wpm = self._current_wpm()
         save_settings({
             "dark_mode": bool(self._safe_get(self.dark_mode, False)),
             "last_mode": self.mode.get(),
             "start_delay": float(self._safe_get(self.start_delay, 5.0)),
-            "char_delay": float(self._safe_get(self.char_delay, 0.05)),
+            "char_delay": wpm_to_interval(current_wpm),
+            "wpm": current_wpm,
             "human_mode": bool(self._safe_get(self.human_mode, True)),
             "loop_mode": bool(self._safe_get(self.loop_mode, False)),
             "fix_indent": bool(self._safe_get(self.fix_indent, True)),
@@ -525,7 +719,7 @@ class AutoTyperApp:
         if not text:
             self.typer_estimate.set("Estimated typing time: -")
         else:
-            base = max(float(self._safe_get(self.char_delay, 0.05)), 0.0)
+            base = self._current_char_interval()
             average = base + (0.03 * 0.275 if self._safe_get(self.human_mode, True) else 0.0)
             total = len(text.replace("\n", "")) * average
             total += text.count("\n") * (base + (0.02 if self._safe_get(self.fix_indent, True) else 0))
@@ -565,6 +759,9 @@ class AutoTyperApp:
         self.style.configure("TCombobox", fieldbackground=c["text_bg"], foreground=c["text_fg"])
         self.style.configure("TNotebook", background=c["bg"])
         self.style.configure("TNotebook.Tab", background=c["bg"], foreground=c["fg"])
+        self.style.configure("Footer.TLabel", background=c["bg"], foreground=c["hint_fg"],
+                             font=("Segoe UI", 8))
+        self.style.configure("Hint.TLabel", background=c["bg"], foreground=c["hint_fg"])
         self.text_box.configure(bg=c["text_bg"], fg=c["text_fg"], insertbackground=c["fg"])
         self.typer_status_label.configure(foreground=c["status_fg"])
         self.clicker_status_label.configure(foreground=c["status_fg"])
@@ -572,6 +769,8 @@ class AutoTyperApp:
         self._refresh_mode_styles()
 
     def _begin_run(self, mode, worker, args):
+        if self.active_mode is not None:
+            return False
         self.active_mode = mode
         self.stop_flag.clear()
         self.pause_flag.clear()
@@ -580,23 +779,34 @@ class AutoTyperApp:
         self.typer_start_btn.configure(state="disabled")
         self.clicker_start_btn.configure(state="disabled")
         self.clear_btn.configure(state="disabled")
+        self.typer_pause_btn.configure(state="normal" if mode == "typer" else "disabled", text="Pause")
+        self.clicker_pause_btn.configure(state="normal" if mode == "clicker" else "disabled", text="Pause")
         (self.typer_stop_btn if mode == "typer" else self.clicker_stop_btn).configure(state="normal")
         status = "Preparing to type..." if mode == "typer" else "Preparing to auto-click..."
         self._show_popout(status)
         self.worker_thread = threading.Thread(target=worker, args=args, daemon=True)
         self.worker_thread.start()
+        return True
 
     def start_typing(self):
         if pyautogui is None:
             messagebox.showerror("Missing dependency", "Install pyautogui first (pip install pyautogui).")
             return
         text = self.text_box.get("1.0", "end-1c")
-        if not text.strip():
-            messagebox.showinfo("Nothing to type", "Type or paste something in the box first.")
+        try:
+            validate_typing_text(text)
+        except ValueError as exc:
+            messagebox.showinfo("Nothing to type", str(exc), parent=self.root)
             return
+        try:
+            validated_wpm = validate_wpm(self.wpm.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid WPM", str(exc), parent=self.root)
+            return
+        with self._wpm_lock:
+            self._live_wpm = validated_wpm
         config = {
             "start_delay": max(float(self._safe_get(self.start_delay, 5)), 0),
-            "base_delay": max(float(self._safe_get(self.char_delay, 0.05)), 0),
             "human": bool(self.human_mode.get()), "loop": bool(self.loop_mode.get()),
             "fix_indent": bool(self.fix_indent.get()), "typo": bool(self.typo_mode.get()),
             "typo_chance": max(float(self._safe_get(self.typo_chance, 0)), 0),
@@ -651,6 +861,7 @@ class AutoTyperApp:
                 self.clicker_status.set(status)
             if self.popout:
                 self.popout.set_running(True, paused=False)
+            self._set_pause_button_text("Pause")
         else:
             self.pause_flag.set()
             self.popout_status.set("Paused")
@@ -660,10 +871,15 @@ class AutoTyperApp:
                 self.clicker_status.set("Paused.")
             if self.popout:
                 self.popout.set_running(True, paused=True)
+            self._set_pause_button_text("Resume")
         self.root.after(10, self._restore_target_focus)
 
-    def _show_popout(self, status):
-        if not self.popout_enabled.get():
+    def _set_pause_button_text(self, text):
+        self.typer_pause_btn.configure(text=text)
+        self.clicker_pause_btn.configure(text=text)
+
+    def _show_popout(self, status, force=False):
+        if not force and not self.popout_enabled.get():
             return
         if self.popout is None or not self.popout.winfo_exists():
             self.popout = PopoutWindow(self)
@@ -672,6 +888,28 @@ class AutoTyperApp:
         self.popout.set_running(True)
         self.popout.deiconify()
         self.popout.lift()
+
+    def _on_window_unmap(self, event):
+        if event.widget is not self.root or self.active_mode is None:
+            return
+        # Tkinter worker threads continue while the main window is minimized.
+        # Force a background control panel so Pause/Stop remain reachable even
+        # when the user's normal pop-out preference is disabled.
+        self.root.after(60, self._ensure_background_controls)
+
+    def _ensure_background_controls(self):
+        if self.active_mode is None or self.root.state() != "iconic":
+            return
+        status = "Paused" if self.pause_flag.is_set() else (
+            "Typing..." if self.active_mode == "typer" else "Auto-clicking...")
+        self._show_popout(status, force=True)
+
+    def _on_window_map(self, event):
+        if (event.widget is self.root and self.active_mode is not None
+                and not self.popout_enabled.get() and self.popout is not None
+                and self.popout.winfo_exists()):
+            self.popout.destroy()
+            self.popout = None
 
     def _close_or_pin_popout(self):
         if self.popout is None or not self.popout.winfo_exists():
@@ -686,15 +924,16 @@ class AutoTyperApp:
         if os.name == "nt":
             try:
                 self.target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-            except Exception:
+            except (OSError, AttributeError) as exc:
+                LOGGER.debug("Could not read the foreground window: %s", exc)
                 self.target_hwnd = None
 
     def _restore_target_focus(self):
         if os.name == "nt" and self.target_hwnd:
             try:
                 ctypes.windll.user32.SetForegroundWindow(self.target_hwnd)
-            except Exception:
-                pass
+            except (OSError, AttributeError) as exc:
+                LOGGER.debug("Could not restore target focus: %s", exc)
 
     def _post(self, name, *args):
         self.ui_queue.put((name, args))
@@ -720,9 +959,18 @@ class AutoTyperApp:
         except queue.Empty:
             pass
         try:
-            self.root.after(40, self._drain_ui_queue)
+            self._ui_after_id = self.root.after(40, self._drain_ui_queue)
         except tk.TclError:
-            pass
+            self._ui_after_id = None
+
+    def _cancel_ui_pump(self):
+        after_id = getattr(self, "_ui_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            self._ui_after_id = None
 
     def _wait_while_paused(self):
         while self.pause_flag.is_set() and not self.stop_flag.is_set():
@@ -770,8 +1018,8 @@ class AutoTyperApp:
                 return True
             time.sleep(0.03)
 
-    @staticmethod
-    def _char_delay_value(base, human):
+    def _char_delay_value(self, human):
+        base = self._current_char_interval()
         delay = base
         if human:
             delay = max(0, random.gauss(base, base * 0.5 + 0.01))
@@ -782,8 +1030,8 @@ class AutoTyperApp:
     def _type_source_char(self, char, config):
         if not self._wait_while_paused():
             return False
-        pyautogui.write(char)
-        return self._sleep_interruptible(self._char_delay_value(config["base_delay"], config["human"]))
+        emit_character(pyautogui, char)
+        return self._sleep_interruptible(self._char_delay_value(config["human"]))
 
     def _type_word(self, word, config, advance):
         make_typo = config["typo"] and len(word) >= 3 and random.random() < config["typo_chance"] / 100
@@ -794,12 +1042,12 @@ class AutoTyperApp:
                     return False
                 wrong = random.choice(TYPO_CHARS.replace(char.lower(), "") or TYPO_CHARS)
                 pyautogui.write(wrong)
-                if not self._sleep_interruptible(self._char_delay_value(config["base_delay"], config["human"])):
+                if not self._sleep_interruptible(self._char_delay_value(config["human"])):
                     return False
                 if not self._sleep_interruptible(random.uniform(0.15, 0.4)):
                     return False
                 pyautogui.press("backspace")
-                if not self._sleep_interruptible(self._char_delay_value(config["base_delay"], config["human"])):
+                if not self._sleep_interruptible(self._char_delay_value(config["human"])):
                     return False
             if not self._type_source_char(char, config):
                 return False
@@ -837,12 +1085,13 @@ class AutoTyperApp:
                             return
                         pyautogui.press("enter")
                         if config["fix_indent"]:
-                            if not self._sleep_interruptible(0.02):
+                            if not self._wait_while_paused():
                                 self._post("finish", "typer", "Stopped.")
                                 return
-                            pyautogui.hotkey("shift", "home")
-                            pyautogui.press("delete")
-                        if not self._sleep_interruptible(config["base_delay"]):
+                            if not clear_editor_auto_indent(pyautogui, self._sleep_interruptible):
+                                self._post("finish", "typer", "Stopped.")
+                                return
+                        if not self._sleep_interruptible(self._current_char_interval()):
                             self._post("finish", "typer", "Stopped.")
                             return
                         advance()
@@ -915,6 +1164,8 @@ class AutoTyperApp:
         self.clicker_start_btn.configure(state="normal")
         self.typer_stop_btn.configure(state="disabled")
         self.clicker_stop_btn.configure(state="disabled")
+        self.typer_pause_btn.configure(state="disabled", text="Pause")
+        self.clicker_pause_btn.configure(state="disabled", text="Pause")
         self.clear_btn.configure(state="normal")
         self._set_mode_switch_enabled(True)
         self._close_or_pin_popout()
@@ -972,11 +1223,16 @@ class AutoTyperApp:
 
     def on_close(self):
         self.stop_flag.set()
+        self._cancel_ui_pump()
         self.save_all_settings()
         self.root.destroy()
 
 
-if __name__ == "__main__":
+def run():
     root = tk.Tk()
-    app = AutoTyperApp(root)
+    AutoTyperApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    run()
