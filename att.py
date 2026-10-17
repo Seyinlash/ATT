@@ -31,7 +31,7 @@ COPYRIGHT_TEXT = "© 2026 Seyinlash. All rights reserved."
 MIN_WPM = 5
 MAX_WPM = 300
 DEFAULT_WPM = 80
-INDENT_SETTLE_SECONDS = 0.10
+INDENT_SETTLE_SECONDS = 0.15
 LOGGER = logging.getLogger("att")
 
 LIGHT = {
@@ -144,14 +144,15 @@ def validate_typing_text(text):
 def clear_editor_auto_indent(backend, wait_fn=time.sleep):
     """Clear only the current editor line after Enter.
 
-    Two Home presses normalize smart-Home behavior across VS Code/Monaco and
-    browser editors. Selecting Home-to-End removes real or delayed auto-indent
-    without selecting content from the preceding line.
+    VS Code and Monaco-based browser editors treat Home as a smart toggle
+    between column zero and the indentation boundary. Pressing Home twice can
+    therefore land back at the indentation boundary and leave the auto-indent
+    untouched. Selecting backward from the current caret reliably captures the
+    whitespace the editor inserted after Enter.
     """
     if wait_fn(INDENT_SETTLE_SECONDS) is False:
         return False
-    backend.press("home", presses=2, interval=0.01)
-    backend.hotkey("shift", "end")
+    backend.hotkey("shift", "home")
     # Delete is deliberately used instead of Backspace: with no indentation
     # selected, Delete is a no-op while Backspace could join the prior line.
     backend.press("delete")
